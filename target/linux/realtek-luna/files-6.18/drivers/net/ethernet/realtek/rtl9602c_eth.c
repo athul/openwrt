@@ -3059,7 +3059,16 @@ static const struct ethtool_ops rtl9602c_wan_ethtool_ops = {
  * Read-only on the switch: nothing is written. One instance (one switch).
  */
 #define RTL9602C_PORT_LED_MAX	4
-#define RTL9602C_PORT_LED_POLL_MS 500
+#define RTL9602C_PORT_LED_POLL_MS 100
+#define RTL9602C_PORT_LED_BLINK_MS 40
+
+/* Activity on the link LEDs: while a port is up, any change of its RX or TX
+ * octet counter (STAT_PORT_RX/TX_MIB, low word) since the previous poll blinks
+ * the LED off for RTL9602C_PORT_LED_BLINK_MS, like most routers' port lamps.
+ * Off = link-only. Writable at runtime via /sys/module/rtl9602c_eth/parameters. */
+static bool port_led_activity = true;
+module_param(port_led_activity, bool, 0644);
+MODULE_PARM_DESC(port_led_activity, "swport<N>-link LEDs blink with the port's traffic (default 1)");
 
 static struct {
 	struct rtl9602c_eth *ep;
@@ -3067,6 +3076,8 @@ static struct {
 	struct led_trigger *trig[RTL9602C_PORT_LED_MAX];
 	char name[RTL9602C_PORT_LED_MAX][16];
 	int last[RTL9602C_PORT_LED_MAX];	/* -1 unknown, 0 down, 1 up */
+	u32 rx[RTL9602C_PORT_LED_MAX], tx[RTL9602C_PORT_LED_MAX];	/* last octet counters */
+	bool have_cnt[RTL9602C_PORT_LED_MAX];	/* rx/tx hold a sample of this link-up */
 	bool dumped;
 } rtl9602c_port_led;
 
@@ -3100,6 +3111,25 @@ static void rtl9602c_port_led_poll(struct work_struct *work)
 			continue;
 		ab = ioread32(ep->sw + ep->swm->p_ablty + 4 * p);
 		up = !!(ab & ABLTY_LINK);
+		if (up && READ_ONCE(port_led_activity) && ep->swm->rx_mib) {
+			/* Low words only: any change means traffic since the last
+			 * poll (a wrap that lands on the same value is harmless). */
+			u32 rx = ioread32(ep->sw + ep->swm->rx_mib + p * SW_STAT_PORT_MIB_STRIDE + 0x00);
+			u32 tx = ioread32(ep->sw + SW_STAT_PORT_TX_MIB + p * SW_STAT_PORT_MIB_STRIDE + 0x28);
+
+			if (rtl9602c_port_led.have_cnt[p] && up == rtl9602c_port_led.last[p] &&
+			    (rx != rtl9602c_port_led.rx[p] || tx != rtl9602c_port_led.tx[p])) {
+				unsigned long on = RTL9602C_PORT_LED_BLINK_MS, off = RTL9602C_PORT_LED_BLINK_MS;
+
+				/* invert: lit, briefly dark on traffic */
+				led_trigger_blink_oneshot(rtl9602c_port_led.trig[p], on, off, 1);
+			}
+			rtl9602c_port_led.rx[p] = rx;
+			rtl9602c_port_led.tx[p] = tx;
+			rtl9602c_port_led.have_cnt[p] = true;
+		} else {
+			rtl9602c_port_led.have_cnt[p] = false;
+		}
 		if (up == rtl9602c_port_led.last[p])
 			continue;
 		led_trigger_event(rtl9602c_port_led.trig[p], up ? LED_FULL : LED_OFF);
