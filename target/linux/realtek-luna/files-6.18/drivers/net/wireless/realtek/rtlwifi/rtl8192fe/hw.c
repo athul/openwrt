@@ -2069,6 +2069,7 @@ void rtl92fe_txdma_error(struct ieee80211_hw *hw)
 	if (!status)
 		return;
 	rtlpci->txdma_err++;
+	rtlpci->txdma_err_at = jiffies ?: 1;
 	rtlpci->txdma_status |= status;
 	rtlpci->txdma_unseen |= status;
 	rtl_write_dword(rtlpriv, REG_TXDMA_STATUS, status);

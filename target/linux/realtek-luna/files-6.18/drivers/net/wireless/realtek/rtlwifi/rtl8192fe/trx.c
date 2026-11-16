@@ -1122,7 +1122,8 @@ static bool rtl92fe_pcie_tx_stuck(struct rtl_priv *rtlpriv)
 /* Vendor check_hangup, re-expressed: on every watchdog tick a queue with
  * frames pending whose HW read index has not moved for TX_HANG_PENDING_S is
  * hung -- unless ANY queue moved or drained this tick, which restarts every
- * clock. Independent of the TXDMA error counter, which stays a diagnostic.
+ * clock. Within TXDMA_ERR_RECENT_S of a TXDMA error the limit drops to
+ * TX_HANG_AFTER_TXDMA_ERR_S; the error counter itself stays a diagnostic.
  * The silicon witness declares a hang on its own.
  */
 bool rtl92fe_tx_hang_detect(struct ieee80211_hw *hw)
@@ -1130,8 +1131,13 @@ bool rtl92fe_tx_hang_detect(struct ieee80211_hw *hw)
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct rtl_pci *rtlpci = rtl_pcidev(rtl_pcipriv(hw));
 	unsigned long now = jiffies ? jiffies : 1;
+	unsigned int limit_s = TX_HANG_PENDING_S;
 	bool stuck = false, alive = false;
 	u8 q;
+
+	if (rtlpci->txdma_err_at &&
+	    time_before(now, rtlpci->txdma_err_at + TXDMA_ERR_RECENT_S * HZ))
+		limit_s = TX_HANG_AFTER_TXDMA_ERR_S;
 
 	for (q = 0; q < RTL_PCI_MAX_TX_QUEUE_COUNT; q++) {
 		struct rtl8192_tx_ring *ring = &rtlpci->tx_ring[q];
@@ -1149,7 +1155,7 @@ bool rtl92fe_tx_hang_detect(struct ieee80211_hw *hw)
 		     0x0fff;
 		if (rtlpci->hang_since[q] && rp == rtlpci->hang_rp[q]) {
 			if (time_after_eq(now, rtlpci->hang_since[q] +
-					       TX_HANG_PENDING_S * HZ))
+					       limit_s * HZ))
 				stuck = true;
 			continue;
 		}

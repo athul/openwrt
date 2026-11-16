@@ -215,6 +215,7 @@ struct rtl_pci {
 	u32 bcn_prep_budget_us;
 	u32 bcn_late;
 	u32 txdma_err;
+	unsigned long txdma_err_at;	/* jiffies of the last TXDMA error, 0 = none */
 	u32 txdma_status;
 	u32 txdma_unseen;	/* TXDMA_STATUS bits not yet judged by the watchdog */
 	u32 tick_us, probe_us;	/* the last watchdog tick's start and its 0x3f3 probe (us) */
