@@ -86,3 +86,26 @@ define Device/hsgq_x100dg
   DEVICE_PACKAGES := -iw gpon-provision
 endef
 TARGET_DEVICES += hsgq_x100dg
+
+# Netlink unit: single NOR bank, vendor mtdparts k0 = 0x400000 (4096k) at
+# 0x100000, r0 = 0x800000 (8192k) at 0x500000. First install is written from
+# U-Boot (sf erase/write, like its upk/upr helpers); sysupgrade writes k0/r0.
+# check-size drops an oversize image (WARNING, file deleted) and the build then
+# fails on the missing file: take images only from a fresh bin/ of a clean build.
+define Device/netlink_hg323rgw
+  DEVICE_VENDOR := Netlink
+  DEVICE_MODEL := HG323RGW (experimental)
+  DEVICE_DTS := rtl9602c_netlink_hg323rgw
+  DEVICE_DTS_DIR := $(DTS_DIR)/realtek-luna
+  SOC := rtl9602c
+  # Unconditional: flash_kernel_size returns empty on debug builds, and k0 is
+  # a hard 4 MiB whatever the kernel config.
+  KERNEL_SIZE := 4096k
+  IMAGE_SIZE := 8192k
+  IMAGES := kernel.bin rootfs.bin sysupgrade.bin
+  IMAGE/kernel.bin := append-kernel | check-size $$(KERNEL_SIZE)
+  IMAGE/rootfs.bin := append-rootfs | pad-rootfs | check-size
+  IMAGE/sysupgrade.bin := append-rootfs | pad-rootfs | check-size | sysupgrade-tar rootfs=$$$$@ | append-metadata
+  DEVICE_PACKAGES := wpad-basic-mbedtls
+endef
+TARGET_DEVICES += netlink_hg323rgw
