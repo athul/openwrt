@@ -1,0 +1,164 @@
+#!/usr/bin/ucode
+// netlink-lightshow: a ~35 s front-panel light show for the Netlink HG323RGW.
+//
+// Drives the 7 software-controllable lamps in panel order through the LED
+// class (all declared in the board DTS):
+//   green:pon  red:los  green:lan-ge  green:lan-fe  green:fxs  green:wps
+//   rtl8192fe-phy0 (WIFI)
+// POWER is hardwired and cannot be controlled.
+//
+// Usage:  netlink-lightshow
+// Each lamp's trigger and brightness are saved first and restored at the end,
+// also on Ctrl-C / SIGTERM / SIGHUP (WIFI goes back to its throughput
+// trigger). A lamp that is missing is skipped, so the show still runs on an
+// image with fewer LEDs. One show at a time: a second instance exits, since it
+// would otherwise save the first one's mid-show state as "original".
+// Timing uses ucode's sleep(ms): this BusyBox has no sub-second sleep, and
+// there is no ucode math module on the image, hence the small LCG below.
+
+let fs = require('fs');
+
+const CLS = '/sys/class/leds/';
+const ORDER = [ 'green:pon', 'red:los', 'green:lan-ge', 'green:lan-fe',
+	'green:fxs', 'green:wps', 'rtl8192fe-phy0' ];
+
+function w(path, val) {
+	let f = fs.open(path, 'w');
+	if (f) {
+		f.write('' + val);
+		f.close();
+	}
+}
+
+function r(path) {
+	let f = fs.open(path, 'r');
+	if (!f)
+		return null;
+	let v = f.read('all');
+	f.close();
+	return v ? trim(v) : null;
+}
+
+let seed = time() & 0x7fffffff;
+function rnd() {
+	seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+	return seed >> 8;
+}
+
+// Lamps present on this image, in panel order, with their state saved.
+let lamps = [];
+for (let name in ORDER) {
+	let t = r(CLS + name + '/trigger');
+	if (t == null)
+		continue;
+	let m = match(t, /\[([^\]]+)\]/);
+	push(lamps, { name: name, trigger: m ? m[1] : 'none',
+		brightness: r(CLS + name + '/brightness') || '0' });
+}
+const N = length(lamps);
+if (!N) {
+	warn('netlink-lightshow: no panel LEDs found under ' + CLS + '\n');
+	exit(1);
+}
+
+// mkdir is atomic: it is the lock. /var/run is tmpfs, so a stale lock from a
+// killed -9 run disappears at reboot (or remove it by hand).
+const LOCK = '/var/run/netlink-lightshow.lock';
+if (!fs.mkdir(LOCK)) {
+	warn('netlink-lightshow: already running (' + LOCK + ')\n');
+	exit(1);
+}
+
+function restore() {
+	for (let l in lamps) {
+		w(CLS + l.name + '/trigger', 'none');
+		w(CLS + l.name + '/brightness', l.brightness);
+		w(CLS + l.name + '/trigger', l.trigger);
+	}
+	fs.rmdir(LOCK);
+}
+
+function on_signal() {
+	restore();
+	print('netlink-lightshow: interrupted, lamps restored\n');
+	exit(130);
+}
+for (let sig in [ 'INT', 'TERM', 'HUP' ])
+	signal(sig, on_signal);
+
+for (let l in lamps)
+	w(CLS + l.name + '/trigger', 'none');
+
+function frame(mask, ms) {
+	for (let i = 0; i < N; i++)
+		w(CLS + lamps[i].name + '/brightness', (mask >> i) & 1);
+	sleep(ms);
+}
+
+const ALL = (1 << N) - 1;
+
+print('netlink-lightshow: ', N, ' lamps\n');
+frame(0, 500);
+
+for (let k = 0; k < 3; k++)			// chase
+	for (let i = 0; i < N; i++)
+		frame(1 << i, 120);
+
+for (let k = 0; k < 4; k++) {			// scanner
+	for (let i = 0; i < N; i++)
+		frame(1 << i, 80);
+	for (let i = N - 2; i > 0; i--)
+		frame(1 << i, 80);
+}
+
+for (let k = 0; k < 2; k++) {			// fill and drain
+	let m = 0;
+	for (let i = 0; i < N; i++) {
+		m |= 1 << i;
+		frame(m, 150);
+	}
+	for (let i = 0; i < N; i++) {
+		m &= ~(1 << i);
+		frame(m, 150);
+	}
+}
+
+for (let k = 0; k < 10; k++)			// alternate
+	frame((k & 1) ? (0x55 & ALL) : (0x2a & ALL), 220);
+
+let mid = N >> 1;				// centre burst
+for (let k = 0; k < 4; k++) {
+	for (let s = 0; s <= mid + 1; s++) {
+		let m = 0;
+		for (let i = mid - s; i <= mid + s; i++)
+			if (i >= 0 && i < N)
+				m |= 1 << i;
+		frame(m, 140);
+	}
+	frame(0, 220);
+}
+
+for (let k = 0; k < 50; k++)			// sparkle
+	frame(rnd() & ALL, 70);
+
+for (let k = 0; k < 5; k++) {			// heartbeat
+	frame(ALL, 100); frame(0, 100);
+	frame(ALL, 100); frame(0, 600);
+}
+
+let d = 200;					// accelerate
+while (d >= 20) {
+	for (let i = 0; i < N; i++)
+		frame(1 << i, d);
+	d = int(d * 0.7);
+}
+
+for (let k = 0; k < 8; k++) {			// finale
+	frame(ALL, 60);
+	frame(0, 60);
+}
+frame(ALL, 1500);
+
+// Restore every lamp as it was.
+restore();
+print('netlink-lightshow: done\n');

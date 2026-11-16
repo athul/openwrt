@@ -1,0 +1,175 @@
+#!/usr/bin/ucode
+// netlink-ledd: front-panel status for the Netlink HG323RGW IoT access point.
+//
+// What the lamps mean (each role can be switched off or moved in
+// /etc/config/netlink_ledd, then `/etc/init.d/netlink-ledd reload`):
+//   internet up   -> green:pon on (flickers with WAN traffic), red:los off
+//   internet down -> green:pon off, red:los on   (LOS finally means "no uplink")
+//   new Wi-Fi client joined -> green:wps blinks for a few seconds
+//   alive         -> green:fxs heartbeat
+// Internet = at least one of the first four configured hosts answers one ping.
+// The LAN LEDs are not touched (they follow the per-socket link triggers or
+// whatever LuCI's LED Configuration sets). While netlink-lightshow runs (its
+// lock directory exists) this daemon leaves the lamps alone.
+//
+// Runs under procd (/etc/init.d/netlink-ledd). On SIGTERM/SIGINT the lamps it
+// drives are switched off and their trigger set to none.
+
+let fs = require('fs');
+let ubus = require('ubus');
+let uci = require('uci').cursor();
+
+const CLS = '/sys/class/leds/';
+const SHOW_LOCK = '/var/run/netlink-lightshow.lock';
+
+function w(path, val) {
+	let f = fs.open(path, 'w');
+	if (f) {
+		f.write('' + val);
+		f.close();
+	}
+}
+
+function exists(led) {
+	return led && led != 'none' && fs.stat(CLS + led + '/brightness') != null;
+}
+
+function cfg(opt, dflt) {
+	let v = uci.get('netlink_ledd', 'main', opt);
+	return v == null ? dflt : v;
+}
+
+// Wall time can jump when NTP sets the clock after boot. Deadlines use the
+// kernel's monotonic uptime instead.
+function uptime() {
+	let f = fs.open('/proc/uptime', 'r');
+	if (!f)
+		return 0;
+	let seconds = int(split(f.read('all'), /\./)[0]);
+	f.close();
+	return seconds;
+}
+
+const up_led = cfg('internet_up_led', 'green:pon');
+const down_led = cfg('internet_down_led', 'red:los');
+const client_led = cfg('new_client_led', 'green:wps');
+const beat_led = cfg('heartbeat_led', 'green:fxs');
+const ap = cfg('ap_ifname', 'phy0-ap0');
+const interval = int(cfg('check_interval', '30')) || 30;
+const blink_s = int(cfg('client_blink_seconds', '4')) || 4;
+// While online the "internet up" lamp also shows WAN traffic: kernel netdev
+// trigger on the WAN device (solid = link, flicker = tx/rx), like the LAN
+// lamps. wan_activity '0' keeps it plain solid. wan_device defaults to the
+// device of network.wan (eth0.3 = the GE socket on this board).
+const wan_activity = cfg('wan_activity', '1') != '0';
+const wan_dev = cfg('wan_device', uci.get('network', 'wan', 'device') || 'eth0.3');
+let hosts = cfg('check_host', [ '1.1.1.1', '8.8.8.8' ]);
+if (type(hosts) != 'array')
+	hosts = split(hosts, /\s+/);
+
+function lamp(led, on) {
+	if (!exists(led))
+		return;
+	w(CLS + led + '/trigger', 'none');
+	w(CLS + led + '/brightness', on ? 1 : 0);
+}
+
+function online() {
+	let tried = 0;
+	for (let h in hosts) {
+		// Limit the number of probes so SIGTERM can run stop(); each ping is
+		// bounded by -W 1. (This BusyBox has no `timeout` applet: wrapping
+		// ping in it made every check exit 127 = "offline", 2026-11-16.)
+		if (tried >= 4)
+			break;
+		if (!match(h, /^[0-9A-Za-z][0-9A-Za-z.:-]*$/))
+			continue;
+		tried++;
+		if (system('ping -c 1 -W 1 ' + h + ' >/dev/null 2>&1') == 0)
+			return true;
+	}
+	return false;
+}
+
+function clients(bus) {
+	let r = bus ? bus.call('hostapd.' + ap, 'get_clients') : null;
+	return (r && r.clients) ? keys(r.clients) : null;
+}
+
+function stop() {
+	for (let led in [ up_led, down_led, client_led, beat_led ])
+		lamp(led, false);
+	exit(0);
+}
+for (let sig in [ 'TERM', 'INT' ])
+	signal(sig, stop);
+
+let bus = ubus.connect();
+let known = null;		// MACs seen on the previous poll (null = first poll)
+let state = null;		// last internet state written
+let blink_until = 0;
+let next_check = 0;
+let beat_set = false;
+let client_reset_needed = true;
+
+while (true) {
+	let now = uptime();
+	let show = fs.stat(SHOW_LOCK) != null;
+
+	if (show) {
+		state = null;	// rewrite everything once the show ends
+		beat_set = false;
+		client_reset_needed = true;
+	} else {
+		// A previous daemon may have died while the timer trigger was active.
+		if (client_reset_needed) {
+			lamp(client_led, false);
+			client_reset_needed = false;
+		}
+		if (!beat_set && exists(beat_led)) {
+			w(CLS + beat_led + '/trigger', 'heartbeat');
+			beat_set = true;
+		}
+
+		if (now >= next_check) {
+			let on = online();
+			if (on !== state) {
+				lamp(up_led, on);
+				lamp(down_led, !on);
+				if (on && wan_activity && exists(up_led) &&
+				    fs.stat('/sys/class/net/' + wan_dev) != null) {
+					w(CLS + up_led + '/trigger', 'netdev');
+					w(CLS + up_led + '/device_name', wan_dev);
+					w(CLS + up_led + '/link', 1);
+					w(CLS + up_led + '/tx', 1);
+					w(CLS + up_led + '/rx', 1);
+				}
+				state = on;
+			}
+			next_check = now + interval;
+		}
+
+		let cur = clients(bus);
+		if (cur == null)
+			bus = ubus.connect();	/* first failure, ubusd restart, or radio off */
+		if (cur != null) {
+			if (known != null && exists(client_led))
+				for (let mac in cur)
+					if (!(mac in known)) {
+						w(CLS + client_led + '/trigger', 'timer');
+						w(CLS + client_led + '/delay_on', 100);
+						w(CLS + client_led + '/delay_off', 100);
+						blink_until = now + blink_s;
+						break;
+					}
+			known = {};
+			for (let mac in cur)
+				known[mac] = true;
+		}
+		if (blink_until && now >= blink_until) {
+			lamp(client_led, false);
+			blink_until = 0;
+		}
+	}
+	sleep(2000);
+}
