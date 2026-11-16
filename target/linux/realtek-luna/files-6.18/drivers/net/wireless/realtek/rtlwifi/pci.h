@@ -215,6 +215,7 @@ struct rtl_pci {
 	u32 bcn_prep_budget_us;
 	u32 bcn_late;
 	u32 txdma_err;
+	unsigned long txdma_err_at;	/* jiffies of the last TXDMA error, 0 = none */
 	u32 txdma_status;
 	u32 tx_hang_resets;
 	u16 hang_rp[RTL_PCI_MAX_TX_QUEUE_COUNT];

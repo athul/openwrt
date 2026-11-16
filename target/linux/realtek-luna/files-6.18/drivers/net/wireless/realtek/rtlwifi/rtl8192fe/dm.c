@@ -30,7 +30,7 @@ module_param_named(dump_rf, rtl92fe_dump_rf, int, 0644);
 static bool rtl92fe_restart_on_tx_hang = true;
 module_param_named(restart_on_tx_hang, rtl92fe_restart_on_tx_hang, bool, 0644);
 MODULE_PARM_DESC(restart_on_tx_hang,
-		 "restart the MAC when TX is stuck: a queue's HW index unmoved for 60 s with no live queue, or the PCIe engine's own 0x3f3 witness (default 1)");
+		 "restart the MAC when TX is stuck: a queue's HW index unmoved for 60 s (3 s within 120 s of a TXDMA error) with no live queue, or the PCIe engine's own 0x3f3 witness (default 1)");
 MODULE_PARM_DESC(dump_rf,
 		 "set 1 to one-shot dump operating RF/BB/MAC-AFE regs in the dm watchdog");
 
@@ -1228,10 +1228,17 @@ void rtl92fe_dm_watchdog(struct ieee80211_hw *hw)
 		rtlpci->tx_hang_resets++;
 		pr_warn("TX stuck: %s (txdma_err=%u so far), restart_on_tx_hang=%d\n",
 			rtlpci->pcie_tx_stuck ? "the PCIe engine reports itself stuck (0x3f3)"
-					      : "a queue's HW index unmoved for 60 s, no other queue alive",
+					      : "a queue's HW index unmoved (60 s, or 3 s after a TXDMA error), no other queue alive",
 			rtlpci->txdma_err, rtl92fe_restart_on_tx_hang);
-		if (rtl92fe_restart_on_tx_hang)
+		if (rtl92fe_restart_on_tx_hang) {
+			/* One fast restart per TXDMA error: rtl_restart_hw keeps
+			 * struct rtl_pci, so forget the error time and every queue
+			 * clock here. A stall the restart does not cure falls back to
+			 * the 60 s rule unless the chip reports a new TXDMA error. */
+			rtlpci->txdma_err_at = 0;
+			memset(rtlpci->hang_since, 0, sizeof(rtlpci->hang_since));
 			rtl_restart_hw(hw);
+		}
 	}
 #ifdef CONFIG_RTLWIFI_DEBUG
 	if (rtl92fe_dump_rf) {

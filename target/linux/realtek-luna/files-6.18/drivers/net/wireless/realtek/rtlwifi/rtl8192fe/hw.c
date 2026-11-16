@@ -2065,6 +2065,7 @@ void rtl92fe_txdma_error(struct ieee80211_hw *hw)
 	if (!status)
 		return;
 	rtlpci->txdma_err++;
+	rtlpci->txdma_err_at = jiffies ?: 1;
 	rtlpci->txdma_status |= status;
 	rtl_write_dword(rtlpriv, REG_TXDMA_STATUS, status);
 	/* The beacon's side of the moment: under an Ethernet load the WiFi TX

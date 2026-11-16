@@ -2307,8 +2307,18 @@
 
 /* PCIe engine self-check (vendor HAL CheckHang88XX, the 8192F arm): write 0x04,
  * read back; 0x05 = TX DMA stuck. The software rule beside it: a queue's HW
- * read index unmoved for 60 s with frames pending and no other queue alive. */
+ * read index unmoved for 60 s with frames pending and no other queue alive
+ * (TX_HANG_AFTER_TXDMA_ERR_S right after a TXDMA error, below). */
 #define REG_PCIE_STUCK_CHK	0x3f3
 #define PCIE_STUCK_CHK_ARM	0x04
 #define PCIE_STUCK_CHK_TX	0x05
 #define TX_HANG_PENDING_S	60
+/* Right after a TXDMA error the same unmoved-index rule fires much sooner: on
+ * the Netlink HG323RGW (2026-11-14) a 0x6000 error left the BE queue dead with
+ * no 0x3f3 witness, and clients dropped (unanswered DHCP renewals) ~40 s before
+ * the 60 s rule restarted the MAC. Only a queue with frames pending and no other
+ * queue alive counts, as above; the 60 s rule is unchanged outside the window.
+ * 3 s with the 2 s watchdog = unmoved across two consecutive intervals; dm.c
+ * clears the window on restart so each error earns one fast restart. */
+#define TX_HANG_AFTER_TXDMA_ERR_S	3
+#define TXDMA_ERR_RECENT_S	120
