@@ -1,15 +1,16 @@
 {
-  "_comment": "Copy to netlink/unit.json (git-ignored) and fill in YOUR unit's values. lan_mac: the MAC on the case label (ELAN_MAC_ADDR in the config partition). wifi_mac: BSSID for the IoT SSID (label MAC + 1 works). wifi_cal: HW_WLAN0_* from your unit's config partition (read with rtk_factory): four arrays of 14 0xNN bytes, plus integers. country: ISO 3166 code for Wi-Fi rules. luci_iot_mac: optional, lets one host on the IoT side open LuCI.",
+  "_comment": "Copy to netlink/unit.json (git-ignored) and fill in YOUR unit's values. lan_mac: the MAC on the case label (ELAN_MAC_ADDR in the config partition). wifi_mac: BSSID for the IoT SSID (label MAC + 1 works). wifi_cal: HW_WLAN0_* from your unit's config partition (read with rtk_factory): four arrays of 14 0xNN bytes, plus integers. country: ISO 3166 code for Wi-Fi rules. luci_iot_mac: optional, lets one host on the IoT side open LuCI. iot_controller_ip: optional, the one home-LAN host (e.g. Home Assistant) allowed to reach IoT devices; default the whole 192.168.1.0/24.",
   "lan_mac": "xx:xx:xx:xx:xx:xx",
   "wifi_mac": "xx:xx:xx:xx:xx:xx",
   "country": "IN",
   "wifi_cal": {
-    "cck_a":  "0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00",
-    "cck_b":  "0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00",
+    "cck_a": "0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00",
+    "cck_b": "0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00",
     "ht40_a": "0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00",
     "ht40_b": "0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00",
     "thermal": 0,
     "xcap": 0,
     "reg_domain": 13
-  }
+  },
+  "iot_controller_ip": "192.168.1.0/24"
 }
