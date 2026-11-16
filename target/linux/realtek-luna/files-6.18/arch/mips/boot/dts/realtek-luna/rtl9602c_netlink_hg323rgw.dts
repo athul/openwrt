@@ -1,0 +1,131 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* Experimental bring-up, based on this unit's verified boot log.
+ * Front-panel LEDs (gpio-leds) and buttons (gpio-keys-polled) are declared
+ * below; optical pad routing is deliberately undeclared.
+ * Persistent install: only k0 (kernel) and r0 (squashfs root + rootfs_data
+ * overlay) are writable; U-Boot, both env copies, config (ISP data, Wi-Fi
+ * calibration) and framework1 stay read-only.
+ */
+/dts-v1/;
+#include "rtl9602c.dtsi"
+/ {
+ model = "Netlink HG323RGW (RTL9602C)";
+ compatible = "netlink,hg323rgw", "realtek,rtl9602c";
+ /* Split-socket mode is part of this image, not something typed in U-Boot:
+  * without port_vlans=1 both copper sockets share one segment, and a wired
+  * IoT device would sit on the home LAN. hw_nat=0 keeps the switch's L34
+  * offload out of the datapath until it is measured with this layout. */
+ chosen { stdout-path = "serial0:115200n8"; bootargs = "console=ttyS0,115200 rtl9602c_eth.port_vlans=1 rtl9602c_eth.hw_nat=0"; };
+ aliases { serial0 = &uart0; };
+ memory@0 { device_type = "memory"; reg = <0 0x08000000>; };
+ reserved-memory {
+  #address-cells = <1>; #size-cells = <1>; ranges;
+  stock-reserved@6eff000 { no-map; reg = <0x06eff000 0x00101000>; };
+  stock-reserved@7eff000 { no-map; reg = <0x07eff000 0x00101000>; };
+ };
+ /* Front-panel lamps, all on SoC GPIOs and all active-low. Mapped on this
+  * unit 2026-11-15/16: FE/GE/WPS from the stock kernel's LED table
+  * (0x80b015b0) and board init (0x80c1def8); PON, LOS and FXS from a
+  * camera-watched GPIO scan (PON/LOS pads are shared with switch LED-controller
+  * outputs 12/13; stock never drove FXS). POWER is hardwired; WIFI is the
+  * radio's own LED (rtl8192fe-phy0). LOS is red only (2-pad LED; its extra
+  * resistor network also lets the optical module's LOS output light it, which
+  * is why it is red at power-on before this driver claims the pin).
+  * FE/GE LAN default to the Ethernet driver's per-socket link triggers
+  * (swport0-link / swport1-link: port 0 = FE, port 1 = GE per the register map
+  * and the X111W reference); every trigger can be changed in LuCI
+  * (System > LED Configuration) or /etc/config/system. The rest start off.
+  * Do not use GPIO 17 (UART0 TX pad) or GPIO 32 (resets the board). */
+ /* Front-panel buttons, active-low, mapped on this unit 2026-11-16 by
+  * watching the stock button inputs (stock reads GPIO 37/38/41) while each
+  * button was pressed. Polled: the luna GPIO driver has no interrupt
+  * support. gpio-button-hotplug turns them into /etc/rc.button events:
+  * RST -> reset (short press reboots, >= 5 s factory reset), WIFI -> rfkill
+  * (double press toggles the radios), PAIR -> wps (/etc/rc.wps: light show). */
+ keys {
+  compatible = "gpio-keys-polled";
+  poll-interval = <20>;
+  key-reset {
+   label = "reset";
+   gpios = <&gpio1 6 1>;	/* stock GPIO 38, "RST" */
+   linux,code = <0x198>;	/* KEY_RESTART */
+   debounce-interval = <60>;
+  };
+  key-wifi {
+   label = "wifi";
+   gpios = <&gpio1 5 1>;	/* stock GPIO 37, "WIFI" */
+   linux,code = <0xf7>;	/* KEY_RFKILL */
+   debounce-interval = <60>;
+  };
+  key-pair {
+   label = "pair";
+   gpios = <&gpio1 9 1>;	/* stock GPIO 41, "PAIR" */
+   linux,code = <0x211>;	/* KEY_WPS_BUTTON */
+   debounce-interval = <60>;
+  };
+ };
+ leds {
+  compatible = "gpio-leds";
+  led-pon {
+   label = "green:pon";
+   gpios = <&gpio0 29 1>;	/* stock GPIO 29 */
+   default-state = "off";
+  };
+  led-los {
+   label = "red:los";
+   gpios = <&gpio0 28 1>;	/* stock GPIO 28 */
+   default-state = "off";
+  };
+  led-lan-fe {
+   label = "green:lan-fe";
+   gpios = <&gpio0 26 1>;	/* stock GPIO 26 */
+   default-state = "off";
+   linux,default-trigger = "swport0-link";
+  };
+  led-lan-ge {
+   label = "green:lan-ge";
+   gpios = <&gpio1 7 1>;	/* stock GPIO 39 */
+   default-state = "off";
+   linux,default-trigger = "swport1-link";
+  };
+  led-fxs {
+   label = "green:fxs";
+   gpios = <&gpio0 30 1>;	/* stock GPIO 30 */
+   default-state = "off";
+  };
+  led-wps {
+   label = "green:wps";
+   gpios = <&gpio1 11 1>;	/* stock GPIO 43 */
+   default-state = "off";
+  };
+ };
+};
+&gpon { status = "disabled"; };
+&spi_nor {
+ partitions {
+  compatible = "fixed-partitions";
+  #address-cells = <1>; #size-cells = <1>;
+  partition@0 { label = "boot"; reg = <0x0 0x40000>; read-only; };
+  partition@40000 { label = "env"; reg = <0x40000 0x2000>; read-only; };
+  partition@42000 { label = "env2"; reg = <0x42000 0x2000>; read-only; };
+  partition@44000 { label = "config"; reg = <0x44000 0xbc000>; read-only; };
+  /* The stock U-Boot boots k0 (bootm b4100000) and passes root=31:5, so r0
+   * must stay the sixth partition (mtd5): never add one before it.
+   * CONFIG_MTD_CMDLINE_PARTS is off, so U-Boot's mtdparts= is ignored and
+   * these nodes are the layout. linux,rootfs: MTD_SPLIT_SQUASHFS_ROOT carves
+   * rootfs_data from the space after the squashfs. sysupgrade
+   * (lib/upgrade/platform.sh) writes the partitions named k0 and r0. */
+  partition@100000 { label = "k0"; reg = <0x100000 0x400000>; };
+  partition@500000 { label = "r0"; reg = <0x500000 0x800000>; linux,rootfs; };
+  partition@d00000 { label = "framework1"; reg = <0xd00000 0x300000>; read-only; };
+ };
+};
+
+/* Factory LAN MAC: each unit has its own (ELAN_MAC_ADDR in its `config`
+ * partition, the MAC printed on the case label). Without one the driver falls
+ * back to the MAC engine's shared silicon default, so give your unit its MAC,
+ * either here:
+ *	&nic { mac-address = [xx xx xx xx xx xx]; };
+ * (the driver takes a DT mac-address first), or with netlink/unit.json, which
+ * the overlay generator turns into a UCI `macaddr` for eth0. Not committed:
+ * it identifies one physical device. */
