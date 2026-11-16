@@ -7,6 +7,7 @@
 #include "eth_pon_link.h"	/* the PON WAN netdev's ethtool link */
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/if_vlan.h>	/* VLAN_HLEN: port_vlans TX padding */
 #include <linux/dma-mapping.h>
 #include <linux/timer.h>
 #include <linux/of.h>
@@ -19,6 +20,8 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include "eth_rx_csum.h"
+#include <linux/leds.h>	/* per-socket link LED triggers */
+#include <linux/workqueue.h>
 #include "luna_eth_regs.h"	/* the family MAC/switch register map + per-chip table */
 #include "luna_gpon_regs.h"	/* the family's luna_sw_io(): a struct hwio over the SWCORE base */
 #include "regtable.h"		/* flowcore: gpon_ind_poll() -- the ONE bounded busy-wait */
@@ -788,8 +791,14 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 			netdev_warn(ep->ndev,
 				    "swcore VLAN table BUSY at VID %d: a WAN VLAN from that one on is dropped before the CPU\n",
 				    rc);
-		/* As stock's 4005: every port and the CPU's extension ports, all untagged */
-		rc = rtl9602c_vlan_write(ep, SW_DEFAULT_VID, 0xf, 0xf, lan_ext);
+		/* As stock's 4005: every port and the CPU's extension ports, all untagged.
+		 * With port_vlans the copper sockets must NOT share it: a frame tagged
+		 * VID 1 on one socket would otherwise be switched in hardware to the
+		 * other, bypassing the host (Netlink HG323RGW, 2026-11-15). The CPU
+		 * keeps VID 1 as its own PVID, so it stays the only member. */
+		rc = rtl9602c_vlan_write(ep, SW_DEFAULT_VID,
+					 port_vlans ? BIT(ep->swm->cpu_port) : 0xf,
+					 port_vlans ? BIT(ep->swm->cpu_port) : 0xf, lan_ext);
 		if (rc < 0)
 			netdev_warn(ep->ndev,
 				    "swcore VLAN 4k-table engine still BUSY after %u tries (rc=%d): default VLAN %u may not be installed, LAN egress may stay filtered\n",
@@ -837,6 +846,16 @@ static void rtl9602c_sw_min_init(struct rtl9602c_eth *ep)
 						SW_VLAN_PB_VID_BITS,
 						vid), w);
 		}
+		/* Per-port VLANs need each VLAN's untag set honoured on egress.
+		 * rtl9602c_uboot_swcore_bringup() leaves every port in keep-format
+		 * (SW_VLAN_EGRESS_TAG = 1), and only luna_gpon's datapath init puts
+		 * them back to ORIG -- which never runs on a board whose DT disables
+		 * the GPON. Do it here, bits [1:0] only, as that init does. */
+		if (port_vlans)
+			for (p = 0; p < SW_VLAN_PB_VID_PORTS; p++)
+				if (ep->swm->port_mask & BIT(p))
+					iowrite32(ioread32(ep->sw + SW_VLAN_EGRESS_TAG + 4 * p) & ~0x3u,
+						  ep->sw + SW_VLAN_EGRESS_TAG + 4 * p);
 		iowrite32(0xf, ep->sw + SW_VLAN_INGRESS);	/* ingress filter, ports 0-3 */
 		iowrite32(SW_VLAN_CTRL_VAL, ep->sw + SW_VLAN_CTRL); /* enable VLAN function */
 		luna_gpon_vlan_filter_ok(pon_vid != 0);
@@ -1546,6 +1565,35 @@ static int rtl9602c_eth_rx(struct rtl9602c_eth *ep, struct rtl9602c_rxq *q, int 
 					rdev = ep->wan_ndev;
 				else
 					ep->host_port = sp;
+				/* port_vlans: frames trapped to the CPU by the control ACL
+				 * (ARP, DHCP) arrive untagged on this board (measured on the
+				 * Netlink HG323RGW, 2026-11-15), but the descriptor names the
+				 * ingress port. Report the socket's VID as an RX-accelerated
+				 * tag so 8021q delivers them to eth0.<2+port>. Frames
+				 * forwarded by the switch's VLAN path arrive tagged with the
+				 * socket's own VID (measured: they were the drops of a
+				 * tag-rejecting v5) -- those go to 8021q as they are.
+				 * An untagged frame is always given the socket's VID, so
+				 * nothing reaches plain eth0. Any other tag -- VID 0, the
+				 * other socket's VID, 802.1ad -- is dropped, or the kernel's
+				 * VLAN-0 strip could let an inner tag pick another device. */
+				if (port_vlans && rdev == ndev &&
+				    sp != ep->swm->cpu_port && sp != ep->swm->pon_port &&
+				    (ep->swm->port_mask & BIT(sp))) {
+					const struct vlan_ethhdr *vh = (const void *)dst;
+
+					if (!eth_type_vlan(vh->h_vlan_proto)) {
+						__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+								       SW_PORT_VID_BASE + sp);
+					} else if (fr.len < VLAN_ETH_HLEN ||
+						   vh->h_vlan_proto != htons(ETH_P_8021Q) ||
+						   (ntohs(vh->h_vlan_TCI) & VLAN_VID_MASK) !=
+						   SW_PORT_VID_BASE + sp) {
+						ndev->stats.rx_dropped++;
+						dev_kfree_skb_any(skb);
+						goto rx_rearm;
+					}
+				}
 				/* DS-OFFER diag (find why the WAN DHCP OFFER misses gpon0):
 				 * log any DHCP-to-client (UDP dst port 68) DS frame + where
 				 * it routed. dst = eth hdr; [12:13]=ethertype 0x0800,
@@ -2494,6 +2542,14 @@ static netdev_tx_t rtl9602c_eth_xmit(struct sk_buff *skb,
 		netif_stop_queue(ndev);
 		return NETDEV_TX_BUSY;
 	}
+	/* With port_vlans the CPU sends 802.1Q-tagged frames and the switch strips
+	 * the tag at the socket: pad (and extend skb->len, which the descriptor
+	 * length below is taken from) to 64 so a tagged ARP or bare ACK does not
+	 * leave the socket as a 56-byte runt. port_vlans=0 is unchanged. */
+	if (port_vlans && skb_put_padto(skb, ETH_ZLEN + VLAN_HLEN)) {
+		spin_unlock_irqrestore(&ep->tx_lock, flags);
+		return NETDEV_TX_OK;	/* skb freed by skb_put_padto */
+	}
 	if (len < ETH_ZLEN) {
 		if (skb_padto(skb, ETH_ZLEN)) {
 			spin_unlock_irqrestore(&ep->tx_lock, flags);
@@ -2990,6 +3046,114 @@ static const struct ethtool_ops rtl9602c_wan_ethtool_ops = {
 	.get_link		= ethtool_op_get_link,
 	.get_link_ksettings	= eth_pon_get_link_ksettings,
 };
+/*
+ * Per-socket link LED triggers: "swport<N>-link" for every copper port.
+ *
+ * WHY: eth0 is the CPU port, and the per-socket VLAN devices (eth0.2/eth0.3
+ * with port_vlans=1) inherit eth0's carrier, so the generic netdev trigger
+ * cannot tell whether a cable is in a given socket. The switch reports each
+ * port's live state in P_ABLTY (luna_sw_map.p_ablty + 4 * port, read-only;
+ * LINK = bit 4, SPEED = bits 1:0). A delayed work polls it every 500 ms and
+ * fires the port's trigger on change, so any LED (DT default-trigger, or
+ * LuCI / /etc/config/system "led" sections) can follow a socket's link.
+ * Read-only on the switch: nothing is written. One instance (one switch).
+ */
+#define RTL9602C_PORT_LED_MAX	4
+#define RTL9602C_PORT_LED_POLL_MS 500
+
+static struct {
+	struct rtl9602c_eth *ep;
+	struct delayed_work work;
+	struct led_trigger *trig[RTL9602C_PORT_LED_MAX];
+	char name[RTL9602C_PORT_LED_MAX][16];
+	int last[RTL9602C_PORT_LED_MAX];	/* -1 unknown, 0 down, 1 up */
+	bool dumped;
+} rtl9602c_port_led;
+
+static void rtl9602c_port_led_poll(struct work_struct *work)
+{
+	static const char * const speed[] = { "10", "100", "1000", "?" };
+	struct rtl9602c_eth *ep = rtl9602c_port_led.ep;
+	unsigned int p;
+
+	/* SWCORE is only known to be enabled once eth0 has opened (the open
+	 * path sets SOC_SW_ENABLE); hw_up stays true for the rest of the boot. */
+	if (!READ_ONCE(ep->hw_up))
+		goto rearm;
+	if (!rtl9602c_port_led.dumped) {
+		/* One-time diagnostic: the register map is ambiguous between a
+		 * 4-byte and a 0x20 per-port stride for P_ABLTY; log both so the
+		 * port-1 offset can be confirmed on hardware. */
+		rtl9602c_port_led.dumped = true;
+		dev_info(ep->dev, "P_ABLTY +4: %08x %08x  +0x20: %08x %08x\n",
+			 ioread32(ep->sw + ep->swm->p_ablty),
+			 ioread32(ep->sw + ep->swm->p_ablty + 4),
+			 ioread32(ep->sw + ep->swm->p_ablty + 0x20),
+			 ioread32(ep->sw + ep->swm->p_ablty + 0x40));
+	}
+
+	for (p = 0; p < RTL9602C_PORT_LED_MAX; p++) {
+		u32 ab;
+		int up;
+
+		if (!rtl9602c_port_led.trig[p])
+			continue;
+		ab = ioread32(ep->sw + ep->swm->p_ablty + 4 * p);
+		up = !!(ab & ABLTY_LINK);
+		if (up == rtl9602c_port_led.last[p])
+			continue;
+		led_trigger_event(rtl9602c_port_led.trig[p], up ? LED_FULL : LED_OFF);
+		/* No message for the first sample's "down"; ratelimited so a
+		 * flapping cable cannot flood the log. */
+		if (up)
+			dev_info_ratelimited(ep->dev, "port %u link up, %s Mb/s %s duplex\n", p,
+					     speed[ab & ABLTY_SPEED],
+					     (ab & ABLTY_DUPLEX) ? "full" : "half");
+		else if (rtl9602c_port_led.last[p] != -1)
+			dev_info_ratelimited(ep->dev, "port %u link down\n", p);
+		rtl9602c_port_led.last[p] = up;
+	}
+rearm:
+	schedule_delayed_work(&rtl9602c_port_led.work,
+			      msecs_to_jiffies(RTL9602C_PORT_LED_POLL_MS));
+}
+
+static void rtl9602c_port_led_stop(void *unused)
+{
+	unsigned int p;
+
+	cancel_delayed_work_sync(&rtl9602c_port_led.work);
+	for (p = 0; p < RTL9602C_PORT_LED_MAX; p++) {
+		led_trigger_unregister_simple(rtl9602c_port_led.trig[p]);
+		rtl9602c_port_led.trig[p] = NULL;
+	}
+}
+
+static void rtl9602c_port_led_init(struct device *dev, struct rtl9602c_eth *ep)
+{
+	unsigned int p, n = 0;
+
+	if (!ep->sw || !ep->swm->p_ablty)
+		return;
+	rtl9602c_port_led.ep = ep;
+	INIT_DELAYED_WORK(&rtl9602c_port_led.work, rtl9602c_port_led_poll);
+	for (p = 0; p < RTL9602C_PORT_LED_MAX; p++) {
+		rtl9602c_port_led.last[p] = -1;
+		if (!(ep->swm->port_mask & BIT(p)) ||
+		    p == ep->swm->cpu_port || p == ep->swm->pon_port)
+			continue;
+		snprintf(rtl9602c_port_led.name[p], sizeof(rtl9602c_port_led.name[p]),
+			 "swport%u-link", p);
+		led_trigger_register_simple(rtl9602c_port_led.name[p],
+					    &rtl9602c_port_led.trig[p]);
+		if (rtl9602c_port_led.trig[p])
+			n++;
+	}
+	if (!n || devm_add_action_or_reset(dev, rtl9602c_port_led_stop, NULL))
+		return;
+	schedule_delayed_work(&rtl9602c_port_led.work, 0);
+	dev_info(dev, "%u per-socket link LED trigger(s) (swport<N>-link)\n", n);
+}
 
 static int rtl9602c_eth_probe(struct platform_device *pdev)
 {
@@ -3200,6 +3364,7 @@ static int rtl9602c_eth_probe(struct platform_device *pdev)
 	ep->omci_mds = (u8)omci_mds_seed;	/* poison seed: fail the OLT's ME2 audit so a warm
 						 * re-admit re-provisions (we hold no persistent MIB) */
 	proc_create("ethdump", 0644, NULL, &rtl9602c_ethdump_pops);
+	rtl9602c_port_led_init(dev, ep);
 	return 0;
 }
 
