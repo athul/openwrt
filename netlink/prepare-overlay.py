@@ -33,6 +33,8 @@ def umac(k):
  if not MAC.match(v): sys.exit(f'unit.json {k}: not a MAC: {v!r}')
  return v.lower()
 lan_mac,wifi_mac,iot_luci_mac=umac('lan_mac'),umac('wifi_mac'),umac('luci_iot_mac')
+iot_controller=unit.get('iot_controller_ip','192.168.1.0/24')
+if not re.match(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$',iot_controller): sys.exit(f'unit.json iot_controller_ip: {iot_controller!r}')
 country=unit.get('country','00')
 if not re.match(r'^[A-Z0-9]{2}$',country): sys.exit(f'unit.json country: {country!r}')
 (o/'etc/dropbear/authorized_keys').write_text(admin_key)
@@ -133,16 +135,16 @@ config dhcp 'iot'
  option start '100'
  option limit '150'
  option leasetime '12h'
+ list dhcp_option '42,10.67.67.1'
 
 config dhcp 'wan'
  option interface 'wan'
  option ignore '1'
 """)
-# IoT may reach the internet only: private destinations (the home LAN among
-# them) are rejected before the iot->wan forwarding applies; towards the router
-# itself only DHCP and DNS. SSH is accepted from private source addresses on the
+# IoT devices have NO internet: there is no iot->wan forwarding, and private
+# destinations are rejected as well. Towards the router only DHCP, DNS and NTP. SSH is accepted from private source addresses on the
 # WAN side (home LAN, incl. a tailnet jump host there) and is key-only below.
-(o/'etc/config/firewall').write_text("""config defaults
+(o/'etc/config/firewall').write_text(("""config defaults
  option syn_flood '1'
  option input 'REJECT'
  option output 'ACCEPT'
@@ -163,10 +165,6 @@ config zone
  option input 'REJECT'
  option output 'ACCEPT'
  option forward 'REJECT'
-
-config forwarding
- option src 'iot'
- option dest 'wan'
 
 config rule
  option name 'Block-IoT-to-private'
@@ -201,6 +199,28 @@ config rule
  option src 'iot'
  option proto 'tcp udp'
  option dest_port '53'
+ option target 'ACCEPT'
+
+# The router itself keeps time over the WAN and serves it to IoT devices
+# (DHCP option 42 announces it), so their clocks work without internet.
+config rule
+ option name 'Allow-IoT-NTP'
+ option src 'iot'
+ option proto 'udp'
+ option dest_port '123'
+ option target 'ACCEPT'
+
+# The home side may open connections to IoT devices (e.g. Home Assistant);
+# IoT can only answer. unit.json iot_controller_ip narrows it to one host
+# (default: the whole home LAN). The controller needs a route:
+# 10.67.67.0/24 via this router's WAN address (on it or the home router).
+config rule
+ option name 'Allow-HA-to-IoT'
+ option src 'wan'
+ option dest 'iot'
+ option proto 'all'
+ list src_ip '{iot_controller}'
+ option family 'ipv4'
  option target 'ACCEPT'
 
 config rule
@@ -255,7 +275,7 @@ config rule
  option src_mac '{iot_luci_mac}'
  option family 'ipv4'
  option target 'ACCEPT'
-""" if iot_luci_mac else ''))
+""" if iot_luci_mac else '')).replace('{iot_controller}', iot_controller))
 # Root has no password in this image, so SSH must be key-only.
 (o/'etc/config/dropbear').write_text("""config dropbear
  option PasswordAuth 'off'
@@ -314,6 +334,8 @@ for src,dst,mode in [
  list check_host '8.8.8.8'
 """)
 # netlink-ledd is started by its init script; enable it at first boot.
+nt=o/'etc/uci-defaults/91-netlink-ntp-server';nt.parent.mkdir(parents=True,exist_ok=True)
+nt.write_text('#!/bin/sh\n# Serve NTP to the IoT network (it has no internet of its own).\nuci set system.ntp.enable_server=1\nuci commit system\nexit 0\n');nt.chmod(0o755)
 ud=o/'etc/uci-defaults/90-netlink-ledd';ud.parent.mkdir(parents=True,exist_ok=True)
 ud.write_text('#!/bin/sh\n/etc/init.d/netlink-ledd enable\nexit 0\n');ud.chmod(0o755)
 print('Prepared overlay:',o)
