@@ -1,0 +1,41 @@
+#!/bin/sh
+# WIFI button (KEY_RFKILL) on the Netlink HG323RGW: toggle every radio, but
+# only on a DOUBLE press (two releases within 1.5 s), so a knock or a single
+# accidental press cannot switch the IoT Wi-Fi off. Replaces the stock
+# /etc/rc.button/rfkill (which toggles on every release); the toggle itself is
+# the stock logic.
+
+[ "${ACTION}" = "released" ] || exit 0
+
+STAMP=/tmp/.netlink-wifi-button
+now=$(cut -d' ' -f1 /proc/uptime | tr -d '.')	# centiseconds since boot
+last=$(cat "$STAMP" 2>/dev/null || echo 0)
+
+if [ $((now - last)) -gt 150 ]; then
+	echo "$now" > "$STAMP"		# first press: wait for the second
+	exit 0
+fi
+rm -f "$STAMP"
+
+. /lib/functions.sh
+
+rfkill_state=0
+
+wifi_rfkill_set() {
+	uci set wireless.$1.disabled=$rfkill_state
+}
+
+wifi_rfkill_check() {
+	local disabled
+	config_get disabled $1 disabled
+	[ "$disabled" = "1" ] || rfkill_state=1
+}
+
+config_load wireless
+config_foreach wifi_rfkill_check wifi-device
+config_foreach wifi_rfkill_set wifi-device
+uci commit wireless
+logger -t netlink-buttons "WIFI double press: radios $( [ $rfkill_state = 1 ] && echo off || echo on )"
+wifi up
+
+return 0

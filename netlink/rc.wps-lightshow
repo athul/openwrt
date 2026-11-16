@@ -1,0 +1,16 @@
+#!/bin/sh
+# PAIR button (KEY_WPS_BUTTON) on the Netlink HG323RGW: start the front-panel
+# light show in the background. /etc/rc.button/wps runs /etc/rc.wps/* in order
+# and stops at the first that succeeds; WPS pairing itself is not offered on
+# this access point. netlink-lightshow refuses to start twice (lock), so
+# repeated presses are harmless.
+[ "$ACTION" = released ] || exit 1
+# The polled button driver reports a phantom PAIR release while the pins
+# settle at boot (seen 2026-11-16). A show then would also snapshot the LED
+# triggers before /etc/init.d/led applies the LuCI settings and restore those
+# early values afterwards, so ignore PAIR for the first 90 s of uptime.
+[ "$(cut -d. -f1 /proc/uptime)" -ge 90 ] || { logger -t netlink-buttons "PAIR ignored during boot"; exit 1; }
+[ -x /usr/bin/netlink-lightshow ] || exit 1
+logger -t netlink-buttons "PAIR released: light show"
+( /usr/bin/netlink-lightshow >/dev/null 2>&1 & )
+exit 0
