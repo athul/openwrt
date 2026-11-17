@@ -8,6 +8,9 @@ the `realtek-luna/taroko` target of
 It turns the ONT into a **dedicated IoT access point** behind a home router.
 GPON is not used.
 
+**New here? Read the step-by-step [GUIDE.md](GUIDE.md):** serial console, backup,
+building, RAM test, flashing, packages, LEDs, buttons and recovery.
+
 > ⚠️ Experimental, tested on one unit (board `HG323RW_V3.6`, factory HW
 > `V3.7`, stock firmware `3.0.00-210529`). Make a full flash backup before
 > writing anything, and keep a serial console connected.
